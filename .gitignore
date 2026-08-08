@@ -1,1 +1,24 @@
 ﻿.venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 所有图片（本地调试产物，不上传）
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+*.PNG
+*.JPG
+
+# 调试截图目录
+shots/
+
+# 环境与编辑器
+.env
+.idea/
+.vscode/
