@@ -1,11 +1,5 @@
 
 
-USER_PROMPT = "打开百度贴吧坦克世界吧，持续打开帖子并回复帖子"
-
-CURRENT_PAGE_INFO = "TODO: 当前页面信息（标题/URL/内容等）"
-
-URL = "https://www.baidu.com"
-
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
@@ -16,6 +10,22 @@ from PIL import Image
 from browser.edge_browser import EdgeBrowser
 from llm.llm import LlamaCppClient, ensure_llama_server
 from tools.draw_tools import _normalize_coords, draw_coords
+from tools.history_tools import append_history, new_history
+
+# 用户指令从本地文本文件读取，程序运行时可中途修改
+PROMPT_FILE = Path(__file__).resolve().parent / "user_prompt.txt"
+DEFAULT_PROMPT = "打开百度贴吧"
+
+URL = "https://www.baidu.com"
+
+
+def load_user_prompt() -> str:
+    """每次调用时从本地文本文件读取用户指令。"""
+    try:
+        text = PROMPT_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        text = DEFAULT_PROMPT
+    return text or DEFAULT_PROMPT
 
 # llama.cpp 本地接口（OpenAI 兼容），默认端口 8080。
 # 模型在启动时通过菜单选择。
@@ -24,42 +34,47 @@ SHOTS_DIR = Path(__file__).resolve().parent / "shots"
 
 
 def main() -> None:
-    global CURRENT_PAGE_INFO
     ensure_llama_server()
     browser = EdgeBrowser()
     browser.start(url=URL)
+    # 固定等待 5 秒，确保页面充分加载
+    browser.page.wait_for_timeout(5000)
 
     client = LlamaCppClient()
 
+    operation_history = new_history()
     try:
         while True:
-            # 第一步：截图并让模型结合用户指令描述页面结构
+            # 第一步：截图并让模型结合用户指令与操作历史判断下一步操作（纯文本分析）
             shot = browser.screenshot()
-            CURRENT_PAGE_INFO = client.describe_page(USER_PROMPT, shot)
-            #print(CURRENT_PAGE_INFO)
-
-            # 第二步：让模型先判断下一步方向（纯文本分析）
-            direction = client.decide_next_action(USER_PROMPT, CURRENT_PAGE_INFO, shot)
+            user_prompt = load_user_prompt()  # 每次循环从文件读取，运行时可改
+            direction = client.decide_next_step(user_prompt, shot, operation_history)
             #print(f"[direction] {direction}")
 
-            # 第三步：让模型基于方向判断产出具体浏览器操作（JSON）
-            decision = client.execute_action(USER_PROMPT, CURRENT_PAGE_INFO, direction, shot)
+            # 第二步：让模型基于方向判断产出具体浏览器操作（JSON）
+            decision = client.execute_action(direction, shot)
             #print(f"下一步: {decision}")
             action = decision.get("action")
 
+            # 任务完成，终止主循环
+            if action == "task_complete":
+                reason = decision.get("reason") or ""
+                print(f"[done] 任务完成: {reason}")
+                break
+
             # 上一步只产出 action/reason，仅当动作为 click/input 时补全具体参数
             if action == "click":
-                params = client.resolve_action_params(json.dumps(decision), shot)
+                params = client.resolve_action_params(json.dumps(decision), direction, shot)
                 decision.update(params)
                 #print(f"[params] {params}")
             elif action == "input":
-                params = client.resolve_input_params(json.dumps(decision), shot)
+                params = client.resolve_input_params(json.dumps(decision), direction, shot)
                 decision.update(params)
             elif action == "open":
-                params = client.resolve_open_params(json.dumps(decision), shot)
+                params = client.resolve_open_params(json.dumps(decision), direction, shot)
                 decision.update(params)
             elif action == "scroll":
-                params = client.resolve_scroll_params(json.dumps(decision), shot)
+                params = client.resolve_scroll_params(json.dumps(decision), direction, shot)
                 decision.update(params)
 
             # 第三步：执行动作
@@ -70,7 +85,7 @@ def main() -> None:
                     x1, y1, x2, y2 = _normalize_coords(tuple(float(v) for v in box), *im.size)[:4]
                     x, y = (x1 + x2) / 2, (y1 + y2) / 2
                 print(f"[act] click: ({x:.3f}, {y:.3f})")
-                browser.click_at(x, y)
+                browser.click_at(x, y, wait_ms=3000)
 
                 # 把点击位置画到原图上并保存，便于核对坐标是否对准
                 SHOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -100,9 +115,16 @@ def main() -> None:
                 continue
 
             # TODO: 任务完成判断，满足条件后 break 跳出
+            action = decision.get("action")
+            reason = decision.get("reason")
+            text = f"动作={action}"
+            if reason:
+                text += f"；原因={reason}"
+            operation_history = append_history(operation_history, text)
             continue
     finally:
-        browser.close()
+        # 不强制关闭浏览器，让网页在 python 进程退出后保留
+        pass
 
 
 if __name__ == "__main__":

@@ -42,15 +42,25 @@ class LlamaCppClient:
 
     # ---- 对话 ----
 
-    def describe_page(self, user_prompt: str, image: bytes) -> str:
-        """让模型结合用户指令描述当前页面，给出可落地的具体操作建议。
+    def decide_next_step(
+        self, user_prompt: str, image: bytes, operation_history: str
+    ) -> str:
+        """让模型结合截图与用户指令，直接判断下一步应执行什么操作。
 
-        复用 chat() 的视觉调用。
+        输入当前截图、用户任务与已执行的操作历史，一步输出具体操作建议
+        （纯文本，不输出 JSON）。复用 chat() 的视觉调用。
         """
-        prompt = f"""我的任务：{user_prompt}
-        
-你的任务：请你简要描述一下当前的页面，并提供有价值的信息，用来帮助我完成任务。你提供的信息需要精确到有助于完成当前任务步骤的具体操作，例如点击哪里，搜集哪些信息，或者在哪里输入哪些信息，是否需要滑动页面，等等。
-你只需要帮我完成当前页面的步骤就行。"""
+        prompt = f"""你是网页自动化助手，你负责操纵浏览器执行用户给你的任务。
+
+用户给你的任务：
+{user_prompt}
+
+已执行的操作历史（每行一次操作，最新的在最后）：
+{operation_history}
+
+你现在应该做：
+先查看当前的截图，结合已执行的操作历史，判断当前处于任务中的哪一步，然后判断为了完成用户任务，下一步应该执行什么操作（例如点击哪里、在哪个输入框输入什么、打开哪个网址、往哪个方向滚动等）。
+"""
         text = self.chat(prompt, image)
         # 去除所有全空白行（保留普通换行）
         lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -58,54 +68,26 @@ class LlamaCppClient:
 
     _ACTION_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
-    def decide_next_action(
-        self, user_prompt: str, page_info: str, image: bytes | None = None
-    ) -> str:
-        """根据页面信息与用户指令，判断下一步方向（纯文本，不输出 JSON）。
-
-        让模型先分析：当前处于任务中的哪一步，为了完成任务下一步该做什么方向。
-        返回分析文本。具体浏览器操作由 execute_action 生成。
-        """
-        prompt = f"""你是网页自动化助手，你负责操纵浏览器执行用户给你的任务。下面是当前任务相关信息：
-
-用户给你的任务：
-{user_prompt}
-
-当前所在的页面信息：
-{page_info}
-
-你现在应该做：
-先查看当前的页面信息，然后判断当前处于任务中的哪一步，然后判断为了完成用户给的任务，下一步应该做什么。
-"""
-        return self.chat(prompt, image)
-
     def execute_action(
-        self, user_prompt: str, page_info: str, decision: str, image: bytes | None = None
+        self, decision: str, image: bytes | None = None
     ) -> dict[str, Any]:
-        """根据用户指令、页面信息与上一步的方向判断，产出具体浏览器操作。
-
-        结构化输出 JSON，动作有四种：
-        - "click": 点击坐标
-        - "open": 打开网页
-        - "input": 点击输入框并输入文本
-        - "scroll": 滚动屏幕
-
-        复用 chat() 纯文本调用。解析失败则无限重试。
-        返回形如 {"action": "...", "reason": "...", ...} 的字典。
         """
-        prompt = f"""你是网页自动化助手，用户给你的任务：
+        """
+        prompt = f"""你是网页操作助手，用户给你的任务：
 {decision}
 
-请决定下一步要执行的具体浏览器操作。下一步的可选项如下：
+要完成这个任务，下一步要执行的具体浏览器操作是什么？操作的可选项如下：
 1 点击某个坐标
 2 打开某个网页
 3 在输入框里输入文本
 4 滚动屏幕
-只输出一个 JSON 对象，不要输出其他内容，格式如下：
-{{"action": "click 或 open 或 input 或 scroll", "reason": "一句话说明为什么这样做"}}
-各字段说明：
+5 任务已完成，不再执行任何操作（终止循环）
 
-action: 下一步动作，只能是 "click"（点击坐标）、"open"（打开网页）、"input"（点击输入框并输入文本）、"scroll"（滚动屏幕）
+只输出一个 JSON 对象，不要输出其他内容，格式如下：
+{{"action": "click 或 open 或 input 或 scroll 或 task_complete", "reason": "一句话说明为什么这样做"}}
+
+各字段说明：
+action: 下一步动作，只能是 "click"（点击坐标）、"open"（打开网页）、"input"（点击输入框并输入文本）、"scroll"（滚动屏幕）、"task_complete"（任务已完成，终止循环）
 reason: 一句话说明为什么这样做
 """
 
@@ -119,16 +101,18 @@ reason: 一句话说明为什么这样做
             except json.JSONDecodeError:
                 continue  # JSON 不合法，重试
             action = data.get("action")
-            if action not in ("click", "open", "input", "scroll"):
+            if action not in ("click", "open", "input", "scroll", "task_complete"):
                 continue  # action 非法，重试
             return data
 
     _ACTION_PARAMS_RE = re.compile(r"\{.*\}", re.DOTALL)
 
-    def resolve_action_params(self, decision: str, image: bytes) -> dict[str, Any]:
+    def resolve_action_params(self, decision: str, direction: str, image: bytes) -> dict[str, Any]:
+        """根据上一步的动作决策与当前操作信息、截图，补全 click 动作的具体参数（JSON）。
+
+        输出 bbox_2d（目标元素包围框）。复用 chat() 视觉调用。解析失败则无限重试。
         """
-        """
-        prompt = f"""我的任务是：
+        prompt = f"""当前需要执行的操作：
 {decision}
 
 请你在页面中找到相关的元素，以json形式输出bbox坐标
@@ -146,10 +130,10 @@ reason: 一句话说明为什么这样做
                 continue
             return data
 
-    def resolve_input_params(self, decision: str, image: bytes) -> dict[str, Any]:
-        """根据上一步的动作决策与截图，补全 input 动作的具体参数（JSON）。
+    def resolve_input_params(self, decision: str, direction: str, image: bytes) -> dict[str, Any]:
+        """根据上一步的动作决策与当前操作信息、截图，补全 input 动作的具体参数（JSON）。
 
-        只接收上一步的 decision（含 action/reason）与截图 image，
+        只接收上一步的 decision（含 action/reason）、当前操作信息 direction 与截图 image，
         输出 bbox_2d（输入框包围框）与 text（要输入的完整文本）。
         复用 chat() 视觉调用。解析失败则无限重试。
         """
@@ -157,6 +141,9 @@ reason: 一句话说明为什么这样做
 
 上一步的动作决策（JSON）：
 {decision}
+
+当前操作的信息：
+{direction}
 
 你现在应该做：
 结合截图，找到目标输入框，只输出一个 JSON 对象，包含该动作需要的字段。不要输出其他内容。
@@ -181,19 +168,20 @@ reason: 一句话说明为什么这样做
                 continue
             return data
 
-    def resolve_open_params(self, decision: str, image: bytes) -> dict[str, Any]:
-        """根据上一步的动作决策与截图，补全 open 动作的具体参数（JSON）。
+    def resolve_open_params(self, decision: str, direction: str, image: bytes) -> dict[str, Any]:
+        """根据上一步的动作决策与当前操作信息、截图，补全 open 动作的具体参数（JSON）。
 
-        只接收上一步的 decision（含 action/reason）与截图 image，
+        只接收上一步的 decision（含 action/reason）、当前操作信息 direction 与截图 image，
         输出 url 字段。复用 chat() 视觉调用。解析失败则无限重试。
         """
-        prompt = f"""你是网页自动化助手。上一步已经决定要执行"打开网页"动作，现在请你补全该动作的具体参数。
+        prompt = f"""你是网页自动化助手。现在需要执行"打开网页"动作，现在请你补全具体要打开什么网页。
 
-上一步的动作决策（JSON）：
+当前的操作：
+{direction}
+
 {decision}
 
-你现在应该做：
-根据上一步的决策，只输出一个 JSON 对象，包含该动作需要的字段。不要输出其他内容。
+请输出一个 JSON 对象，包含该动作需要的字段。不要输出其他内容。
 
 需要输出的字段如下：
 - "open"：输出 url = "要打开的完整网址"（以 http:// 或 https:// 开头）。
@@ -214,19 +202,20 @@ reason: 一句话说明为什么这样做
                 continue
             return data
 
-    def resolve_scroll_params(self, decision: str, image: bytes) -> dict[str, Any]:
-        """根据上一步的动作决策与截图，补全 scroll 动作的具体参数（JSON）。
+    def resolve_scroll_params(self, decision: str, direction: str, image: bytes) -> dict[str, Any]:
+        """根据上一步的动作决策与当前操作信息、截图，补全 scroll 动作的具体参数（JSON）。
 
-        只接收上一步的 decision（含 action/reason）与截图 image，
+        只接收上一步的 decision（含 action/reason）、当前操作信息 direction 与截图 image，
         输出 scroll_dir 字段。复用 chat() 视觉调用。解析失败则无限重试。
         """
-        prompt = f"""你是网页自动化助手。上一步已经决定要执行"滚动屏幕"动作，现在请你补全该动作的具体参数。
+        prompt = f"""你是网页自动化助手。现在需要执行"滚动屏幕"动作，现在请你补全要往上面还是下面滚动网页。
 
-上一步的动作决策（JSON）：
+当前的操作：
+{direction}
+
 {decision}
 
-你现在应该做：
-根据上一步的决策，只输出一个 JSON 对象，包含该动作需要的字段。不要输出其他内容。
+请输出一个 JSON 对象，包含该动作需要的字段。不要输出其他内容。
 
 需要输出的字段如下：
 - "scroll"：输出 scroll_dir = "up" 或 "down"。
@@ -510,9 +499,12 @@ def ensure_llama_server(think: bool | None = None, model: dict | None = None) ->
     if mmproj_path is not None:
         args += ["--mmproj", str(mmproj_path)]
     args += [
-        "-c", "10000",
+        "-c", "4000",
         "--port", "8080",
         "--reasoning", "on" if think else "off",
+        "--flash-attn", "on",
+        "--cache-type-k", "q4_0",
+        "--cache-type-v", "q4_0",
     ]
     if not LLAMA_SERVER_EXE.exists():
         print(f"[!] 找不到 {LLAMA_SERVER_EXE}，请手动启动服务")

@@ -114,8 +114,10 @@ python -m playwright install msedge
 python main.py
 ```
 
-Set the `USER_PROMPT` at the top of `main.py` to your task and `URL` to the
-starting page, then run.
+Put your task instruction in `user_prompt.txt` (next to `main.py`) and set
+`URL` to the starting page in `main.py`, then run. The prompt is re-read each
+loop, so you can edit `user_prompt.txt` while the program is running and it
+takes effect immediately.
 
 ## Extensible Actions
 

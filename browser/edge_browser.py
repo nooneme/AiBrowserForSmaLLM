@@ -40,10 +40,57 @@ class EdgeBrowser:
         args: list[str] = []
         # 默认最大化窗口打开（配合 no_viewport 跟随真实窗口尺寸）
         args.append("--start-maximized")
-        # 避免复用 profile 时提示"正在使用此配置"
         if self.headless:
             args.append("--headless")
+        else:
+            # 有头模式关闭 blink 的自动化控制特征，减小被识别为自动化的概率
+            # （配合 start() 里注入的 stealth init script 一起生效）
+            args.append("--disable-blink-features=AutomationControlled")
         return args
+
+    def _stealth_init_script(self) -> str:
+        """在页面加载前注入的伪装脚本。
+
+        针对"真实 Edge + 有头"场景只补自动化层叠加的痕迹：
+        1. 藏掉 navigator.webdriver（CDP 驱动必置 true）
+        2. 让 webdriver 的 getter toString 伪装成原生，防函数比对
+        3. 屏蔽自动化层覆盖 document 原生方法的痕迹
+        """
+        return r"""
+// 1. 隐藏 navigator.webdriver
+Object.defineProperty(navigator, 'webdriver', {
+    get: () => undefined,
+});
+
+// 2. 把 webdriver getter 的 toString 伪装回原生，防止检测做函数源码比对
+(function () {
+    const origToString = Function.prototype.toString;
+    const wdGetter = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');
+    Function.prototype.toString = function () {
+        if (this === wdGetter.get) {
+            return 'function get webdriver() { [native code] }';
+        }
+        return origToString.call(this);
+    };
+})();
+
+// 3. 恢复可能被自动化层改写/暴露的原生方法痕迹
+(function () {
+    // 防止自动化层残留的 __playwright / _playwright 全局对象被扫到
+    const leaked = ['__playwright', '_playwright', '__pw_manual', '__pwViewportScale'];
+    for (const k of leaked) {
+        try {
+            if (k in window) {
+                Object.defineProperty(window, k, {
+                    value: undefined,
+                    writable: true,
+                    configurable: true,
+                });
+            }
+        } catch (_) {}
+    }
+})();
+"""
 
     def start(self, url: str = "about:blank") -> Page:
         """启动持久化 Edge 上下文，复用已有 profile 目录。"""
@@ -71,6 +118,9 @@ class EdgeBrowser:
         # 新页面弹出（window.open / target=_blank / 页面自行跳转新标签）时
         # 自动跟随最新页面，保证 screenshot/click_at 操作的是当前显示页
         self.context.on("page", self._on_page)
+        # 在页面脚本执行前注入伪装，隐藏自动化痕迹（navigator.webdriver 等）。
+        # 用 context 级别，保证后续新打开的标签页也自动带上。
+        self.context.add_init_script(self._stealth_init_script())
         self.page.goto(url, wait_until="domcontentloaded")
         return self.page
 
@@ -209,15 +259,33 @@ class EdgeBrowser:
         direction: str = "down",
         factor: float = 0.75,
         wait_ms: int = 500,
+        x: float = 0.5,
+        y: float = 0.5,
+        normalized: bool = True,
     ) -> None:
         """滚动当前页面，每次滚动 3/4 个视口高度。
+
+        滚动前默认把鼠标移到屏幕正中间 (0.5, 0.5)，因为 wheel 事件只
+        作用于鼠标指针所在区域的滚动容器；要滚左右两侧时用 x 指定即可。
 
         direction: "up" 或 "down"，指定滚动方向。
         factor: 滚动量（相对视口高度比例），默认 0.75。
         wait_ms: 滚动完成后的等待毫秒数。
+        x, y: 滚动前鼠标移到的位置。默认居中 (0.5, 0.5)。
+        normalized: x,y 为归一化坐标 (0~1) 时为 True，否则为像素。
         """
         if self.page is None:
             raise RuntimeError("浏览器尚未启动，请先调用 start()")
+        if normalized:
+            if self.page.viewport_size:
+                vp = self.page.viewport_size
+                mx, my = x * vp["width"], y * vp["height"]
+            else:
+                window = self.page.evaluate("() => ({w: innerWidth, h: innerHeight})")
+                mx, my = x * window["w"], y * window["h"]
+        else:
+            mx, my = x, y
+        self.page.mouse.move(mx, my)
         if self.page.viewport_size:
             h = self.page.viewport_size["height"]
         else:
@@ -274,19 +342,19 @@ def _main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="用 Playwright 启动本地 Edge，复用已有 profile")
-    parser.add_argument("url", nargs="?", default="https://www.bing.com", help="要打开的网址")
+    parser.add_argument("url", nargs="?", default="https://www.baidu.com", help="要打开的网址")
     parser.add_argument("--profile", default=PROFILE_DIR, help="Edge 用户配置目录")
     parser.add_argument("--headless", action="store_true", help="无头模式")
     args = parser.parse_args()
 
     browser = EdgeBrowser(profile_dir=args.profile, headless=args.headless)
-    try:
-        page = browser.start(url=args.url)
-        print(f"[OK] 已打开: {args.url}")
-        print(f"[OK] 标题: {page.title()}")
-        input("按回车退出...")
-    finally:
-        browser.close()
+    page = browser.start(url=args.url)
+    print(f"[OK] 已打开: {args.url}")
+    print(f"[OK] 标题: {page.title()}")
+    print("[*] 浏览器已打开，无限等待中...（Ctrl+C 结束）")
+    while True:
+        import time
+        time.sleep(3600)
 
 
 if __name__ == "__main__":
