@@ -12,11 +12,13 @@
 
 from __future__ import annotations
 
+import random
+import time
 from pathlib import Path
 
 from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
 
-PROFILE_DIR = r"C:\Users\z\Desktop\project\qiongguicode\edge_manual_profile"
+PROFILE_DIR = r"C:\Users\z\Desktop\project\qiongguicode\edge_manual_profile2"
 
 
 class EdgeBrowser:
@@ -35,6 +37,7 @@ class EdgeBrowser:
         self._pw: Playwright | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
+        self._last_mouse: tuple[float, float] | None = None
 
     def _launch_args(self) -> list[str]:
         args: list[str] = []
@@ -51,44 +54,116 @@ class EdgeBrowser:
     def _stealth_init_script(self) -> str:
         """在页面加载前注入的伪装脚本。
 
-        针对"真实 Edge + 有头"场景只补自动化层叠加的痕迹：
-        1. 藏掉 navigator.webdriver（CDP 驱动必置 true）
-        2. 让 webdriver 的 getter toString 伪装成原生，防函数比对
-        3. 屏蔽自动化层覆盖 document 原生方法的痕迹
+        针对"真实 Edge + 有头 + CDP 驱动"补自动化层叠加的痕迹。CDP 驱动
+        （Playwright）会在真实浏览器上额外暴露以下区别，这里逐项抹平：
+        1. navigator.webdriver 被置 true —— 藏掉并加固 descriptor，防站点读
+           getter 源码 / 检查 descriptor 属性。
+        2. window.chrome 及 chrome.runtime 等在纯 CDP 上下文里缺失 —— 补齐。
+        3. permissions.query / Notification.permission 被限制 —— 放开。
+        4. navigator.plugins / mimeTypes 被 CDP 清空 —— 无法伪造数量时至少
+           保证查询不抛错（真 Edge 本身有值，此项主要是兜底）。
+        5. 自动化层残留的 __playwright / _playwright 等全局对象 —— 清掉。
+        6. WebGL / mediaDevices / languages 等可能被识别 —— 补齐常见值。
         """
         return r"""
-// 1. 隐藏 navigator.webdriver
-Object.defineProperty(navigator, 'webdriver', {
-    get: () => undefined,
-});
-
-// 2. 把 webdriver getter 的 toString 伪装回原生，防止检测做函数源码比对
 (function () {
+    // 1. 隐藏 navigator.webdriver，并让 getter 伪装成原生，防源码比对
+    //    用一个真实 getter 函数返回 undefined，再给它的 toString 打补丁，
+    //    使 Function.prototype.toString.call(getter) 显示为原生代码。
+    const wdGetter = function () { return undefined; };
+    const WDSOURCE = 'function get webdriver() { [native code] }';
     const origToString = Function.prototype.toString;
-    const wdGetter = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');
+    wdGetter.toString = function () { return WDSOURCE; };
+    Object.defineProperty(Navigator.prototype, 'webdriver', {
+        get: wdGetter,
+        set: undefined,
+        enumerable: true,
+        configurable: true,
+    });
+    // 兜底：拦截对任意函数 toString 的调用，若命中 webdriver getter 则给原生样源码
     Function.prototype.toString = function () {
-        if (this === wdGetter.get) {
-            return 'function get webdriver() { [native code] }';
-        }
+        if (this === wdGetter) return WDSOURCE;
         return origToString.call(this);
     };
-})();
+    const wdDesc = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');
+    void wdDesc;
 
-// 3. 恢复可能被自动化层改写/暴露的原生方法痕迹
-(function () {
-    // 防止自动化层残留的 __playwright / _playwright 全局对象被扫到
-    const leaked = ['__playwright', '_playwright', '__pw_manual', '__pwViewportScale'];
+    // 2. 补齐 window.chrome（真 Edge 有，且带 runtime/csi/loadTimes）
+    if (!window.chrome) {
+        Object.defineProperty(window, 'chrome', { value: {}, configurable: true });
+    }
+    const chrome = window.chrome;
+    chrome.runtime = chrome.runtime || {};
+    chrome.csi = chrome.csi || (() => {});
+    chrome.loadTimes = chrome.loadTimes || (() => {});
+    chrome.app = chrome.app || {};
+    if (!('webstore' in chrome)) chrome.webstore = chrome.webstore || {};
+
+    // 3. 放开 permissions.query / Notification.permission
+    try {
+        if (window.Notification) {
+            Object.defineProperty(Notification, 'permission', {
+                get: () => 'default',
+                set: undefined,
+                configurable: true,
+            });
+        }
+        if (navigator.permissions && navigator.permissions.query) {
+            const origQuery = navigator.permissions.query;
+            navigator.permissions.query = (params) => (
+                params && params.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission, onchange: null })
+                    : origQuery(params)
+            );
+        }
+    } catch (_) {}
+
+    // 4. navigator.plugins / mimeTypes：CDP 下可能为空，真机不触发，兜底防抛错
+    try {
+        if (navigator.plugins && navigator.plugins.length === 0) {
+            const p = [{ name: 'PDF Viewer' }];
+            Object.defineProperty(navigator.plugins, 'length', { value: p.length });
+        }
+        if (navigator.languages && navigator.languages.length === 0) {
+            Object.defineProperty(navigator, 'languages', { value: ['zh-CN', 'zh', 'en'], configurable: true });
+        }
+    } catch (_) {}
+
+    // 5. 清掉自动化层残留的全局对象
+    const leaked = ['__playwright', '_playwright', '__pw_manual', '__pwViewportScale', '__pwLiveBindings'];
     for (const k of leaked) {
         try {
             if (k in window) {
                 Object.defineProperty(window, k, {
-                    value: undefined,
-                    writable: true,
-                    configurable: true,
+                    value: undefined, writable: true, configurable: true,
                 });
             }
         } catch (_) {}
     }
+
+    // 6. WebGL 常见检测：补齐渲染器字段（真 Edge 是 ANGLE + 显卡型号）
+    try {
+        const c = document.createElement('canvas');
+        const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+        if (gl && !gl.getExtension('WEBGL_debug_renderer_info')) {
+            const fake = { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
+            const origGetExt = gl.getExtension.bind(gl);
+            gl.getExtension = (name) => origGetExt(name) || fake;
+        }
+    } catch (_) {}
+
+    // 7. mediaDevices.enumerateDevices 补齐（真机往往非空，这里保证不抛）
+    try {
+        if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+            const orig = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+            navigator.mediaDevices.enumerateDevices = () =>
+                orig().then(list =>
+                    list.length ? list : [{ deviceId: '', kind: 'audioinput' }]
+                );
+        }
+    } catch (_) {}
+
+    window.__stealth_ready = true;
 })();
 """
 
@@ -159,6 +234,54 @@ Object.defineProperty(navigator, 'webdriver', {
         data = self.page.screenshot(**kwargs)
         return out if path is not None else data
 
+    def _human_move(
+        self,
+        x: float,
+        y: float,
+        *,
+        jitter: float = 0.03,
+        steps: int | None = None,
+    ) -> None:
+        """把鼠标从当前位置以带随机抖动、多步贝塞尔式轨迹移到目标像素点。
+
+        直接 mouse.click 是瞬移命中，会被行为指纹识别；这里分多步 move，
+        每步加一点随机偏移和随机停顿，更接近真人手臂移动。全程约几十~上百毫秒。
+        """
+        if self.page is None:
+            raise RuntimeError("浏览器尚未启动，请先调用 start()")
+        steps = steps or random.randint(14, 26)
+        if self._last_mouse is not None:
+            sx, sy = self._last_mouse
+        else:
+            # 无历史位置时从页面中心开始移动，避免从 (0,0) 飞过去显得机械
+            w = self.page.evaluate("() => ({w: innerWidth, h: innerHeight})")
+            sx, sy = w["w"] / 2, w["h"] / 2
+        # 每步的随机中间点（二次贝塞尔），让轨迹弯曲不沿直线
+        cx = sx + (x - sx) * (0.3 + random.random() * 0.4)
+        cy = sy + (y - sy) * (0.3 + random.random() * 0.4)
+        for i in range(1, steps + 1):
+            t = i / steps
+            # 二次贝塞尔插值
+            inv = (1 - t) ** 2
+            px = inv * sx + 2 * (1 - t) * t * cx + t * t * x
+            py = inv * sy + 2 * (1 - t) * t * cy + t * t * y
+            # 终点收敛抖动，避免在目标点附近发抖
+            j = jitter * (1 - t)
+            px += random.uniform(-j, j)
+            py += random.uniform(-j, j)
+            self.page.mouse.move(px, py)
+            # 微停顿：越接近终点越快，模拟真人点击前的瞄准停顿
+            time.sleep(random.uniform(0.004, 0.018))
+        # 末端稍作停顿，再轻点（避免与上一步过于机械衔接）
+        self._last_mouse = (x, y)
+        time.sleep(random.uniform(0.02, 0.09))
+
+    def _rand_wait(self, lo: int, hi: int) -> None:
+        """在 [lo, hi] 毫秒间随机等待，模拟真人反应间隔。"""
+        if self.page is None:
+            raise RuntimeError("浏览器尚未启动，请先调用 start()")
+        self.page.wait_for_timeout(random.randint(lo, hi))
+
     def click_at(
         self,
         x: float,
@@ -185,9 +308,12 @@ Object.defineProperty(navigator, 'webdriver', {
                 px, py = x * viewport["width"], y * viewport["height"]
         else:
             px, py = x, y
+        # 先做随机停顿，再用多步轨迹移动，最后点击
+        self._rand_wait(120, 420)
+        self._human_move(px, py)
         self.page.mouse.click(px, py)
         if wait_ms:
-            self.page.wait_for_timeout(wait_ms)
+            self._rand_wait(max(0, wait_ms - 250), wait_ms + 120)
 
     def type_text(
         self,
@@ -223,12 +349,17 @@ Object.defineProperty(navigator, 'webdriver', {
                     px, py = x * viewport["width"], y * viewport["height"]
             else:
                 px, py = x, y
+            self._rand_wait(120, 400)
+            self._human_move(px, py)
             self.page.mouse.click(px, py)
-        self.page.keyboard.type(text, delay=delay_ms)
+        self._rand_wait(150, 400)
+        # 逐字输入，每字延迟在 delay_ms 基础上随机抖动，模拟真人敲击
+        self.page.keyboard.type(text, delay=max(0, int(delay_ms * random.uniform(0.6, 1.4))))
         if enter:
+            self._rand_wait(200, 600)
             self.page.keyboard.press("Enter")
         if wait_ms:
-            self.page.wait_for_timeout(wait_ms)
+            self._rand_wait(max(0, wait_ms - 250), wait_ms + 120)
 
     def list_pages(self) -> str:
         """列出当前所有打开的标签页，返回纯文本（每行一条）。"""
@@ -285,7 +416,7 @@ Object.defineProperty(navigator, 'webdriver', {
                 mx, my = x * window["w"], y * window["h"]
         else:
             mx, my = x, y
-        self.page.mouse.move(mx, my)
+        self._human_move(mx, my)
         if self.page.viewport_size:
             h = self.page.viewport_size["height"]
         else:
@@ -295,9 +426,14 @@ Object.defineProperty(navigator, 'webdriver', {
             py = -int(h * factor)
         else:
             py = int(h * factor)
-        self.page.mouse.wheel(0, py)
+        # 滚动分 2~3 次完成，更接近真人滚轮节奏
+        n = random.randint(2, 3)
+        step = max(1, int(py / n))
+        for _ in range(n):
+            self.page.mouse.wheel(0, step)
+            time.sleep(random.uniform(0.02, 0.06))
         if wait_ms:
-            self.page.wait_for_timeout(wait_ms)
+            self._rand_wait(max(0, wait_ms - 200), wait_ms + 100)
 
     def go_back(self, wait_ms: int = 1500) -> None:
         """浏览器后退到上一个页面。
