@@ -28,10 +28,14 @@ class EdgeBrowser:
         headless: bool = False,
         user_agent: str | None = None,
         detached: bool = True,
+        window_size: tuple[int, int] | None = (1280, 720),
     ) -> None:
+        """window_size: 窗口初始尺寸 (宽, 高)；None 则默认最大化。
+        no_viewport 模式下窗口多大、viewport 就跟随多大。"""
         self.profile_dir = Path(profile_dir)
         self.headless = headless
         self.user_agent = user_agent
+        self.window_size = window_size
         # detached=True 时浏览器与脚本解耦：脚本退出后浏览器保持运行不关闭
         self.detached = detached
         self._pw: Playwright | None = None
@@ -41,8 +45,12 @@ class EdgeBrowser:
 
     def _launch_args(self) -> list[str]:
         args: list[str] = []
-        # 默认最大化窗口打开（配合 no_viewport 跟随真实窗口尺寸）
-        args.append("--start-maximized")
+        if self.window_size is not None:
+            # 指定窗口尺寸（配合 no_viewport 跟随真实窗口尺寸）
+            args.append(f"--window-size={self.window_size[0]},{self.window_size[1]}")
+        else:
+            # 默认最大化窗口打开（配合 no_viewport 跟随真实窗口尺寸）
+            args.append("--start-maximized")
         if self.headless:
             args.append("--headless")
         else:
@@ -458,6 +466,16 @@ class EdgeBrowser:
         if wait_ms:
             self.page.wait_for_timeout(wait_ms)
 
+    def refresh(self, wait_ms: int = 1500) -> None:
+        """刷新当前页面。
+
+        wait_ms: 刷新后等待的毫秒数，便于页面重新加载。
+        """
+        if self.page is None:
+            raise RuntimeError("浏览器尚未启动，请先调用 start()")
+        self.page.reload(wait_until="domcontentloaded")
+        if wait_ms:
+            self.page.wait_for_timeout(wait_ms)
 
     def close(self) -> None:
         """主动关闭上下文与浏览器，释放 profile 目录占用。

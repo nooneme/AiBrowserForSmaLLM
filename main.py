@@ -8,7 +8,7 @@ import json
 from PIL import Image
 
 from browser.edge_browser import EdgeBrowser
-from llm.llm import LlamaCppClient, ensure_llama_server
+from llm.llm import LlamaCppClient
 from tools.draw_tools import _normalize_coords, draw_coords
 from tools.history_tools import append_history, new_history
 
@@ -34,7 +34,6 @@ SHOTS_DIR = Path(__file__).resolve().parent / "shots"
 
 
 def main() -> None:
-    ensure_llama_server()
     browser = EdgeBrowser()
     browser.start(url=URL)
     # 固定等待 5 秒，确保页面充分加载
@@ -43,8 +42,8 @@ def main() -> None:
     client = LlamaCppClient()
 
     operation_history = new_history()
-    try:
-        while True:
+    while True:
+        try:
             # 第一步：截图并让模型结合用户指令与操作历史判断下一步操作（纯文本分析）
             shot = browser.screenshot()
             user_prompt = load_user_prompt()  # 每次循环从文件读取，运行时可改
@@ -55,12 +54,6 @@ def main() -> None:
             decision = client.execute_action(direction, shot)
             #print(f"下一步: {decision}")
             action = decision.get("action")
-
-            # 任务完成，终止主循环
-            if action == "task_complete":
-                reason = decision.get("reason") or ""
-                print(f"[done] 任务完成: {reason}")
-                break
 
             # 上一步只产出 action/reason，仅当动作为 click/input 时补全具体参数
             if action == "click":
@@ -110,21 +103,22 @@ def main() -> None:
                 direction = decision.get("scroll_dir") or "down"
                 print(f"[act] scroll: {direction}")
                 browser.scroll(direction=direction)
+            elif action == "refresh":
+                print("[act] refresh")
+                browser.refresh()
             else:
                 print(f"[!] 未知动作: {action}")
                 continue
 
-            # TODO: 任务完成判断，满足条件后 break 跳出
             action = decision.get("action")
             reason = decision.get("reason")
             text = f"动作={action}"
             if reason:
                 text += f"；原因={reason}"
             operation_history = append_history(operation_history, text)
+        except Exception as e:
+            print(f"[!] 出错，重试: {e}")
             continue
-    finally:
-        # 不强制关闭浏览器，让网页在 python 进程退出后保留
-        pass
 
 
 if __name__ == "__main__":
