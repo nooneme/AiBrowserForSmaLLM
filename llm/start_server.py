@@ -131,15 +131,6 @@ def _choose_item(options: list[tuple[str, str]]) -> int:
     return idx
 
 
-def _choose_think() -> bool:
-    """上下键选择思考开关，回车确认。返回 True=开 / False=关。"""
-    options = [
-        ("开启思考", "--reasoning on"),
-        ("关闭思考", "--reasoning off"),
-    ]
-    return _choose_item(options) == 0
-
-
 def _choose_model(models: list[dict]) -> dict:
     """上下键选择要加载的模型，回车确认。返回选中模型的 dict。"""
     if not models:
@@ -151,10 +142,9 @@ def _choose_model(models: list[dict]) -> dict:
     return models[_choose_item(options)]
 
 
-def ensure_llama_server(think: bool | None = None, model: dict | None = None) -> dict | None:
+def ensure_llama_server(model: dict | None = None) -> dict | None:
     """若 8080 端口没有 llama.cpp 服务，则自动启动。
 
-    think: True 开思考 / False 关思考 / None 用上下键交互选择。
     model: 指定模型 dict；None 则扫描并用上下键交互选择。
     服务已在运行时直接返回（返回 None）。
     返回实际选用的模型 dict（服务未运行并成功启动时）。
@@ -170,15 +160,11 @@ def ensure_llama_server(think: bool | None = None, model: dict | None = None) ->
         print("[*] 扫描可用模型...")
         model = _choose_model(_scan_models())
 
-    if think is None:
-        think = _choose_think()
-
     model_path = model["model_path"]
     mmproj_path = model.get("mmproj_path")
 
     print(f"[*] 加载模型: {model_path.name}  "
           f"({'多模态' if mmproj_path else '纯文本'})")
-    print(f"[*] 思考模式: {'开' if think else '关'}，正在启动...")
     args = [
         str(LLAMA_SERVER_EXE),
         "-m", str(model_path),
@@ -188,9 +174,8 @@ def ensure_llama_server(think: bool | None = None, model: dict | None = None) ->
     args += [
         "-ngl", "-1",
         "-t", "14",
-        "-c", "150000",
+        "-c", "10000",
         "--port", "8080",
-        "--reasoning", "on" if think else "off",
         "--flash-attn", "on",
         "--cache-type-k", "q4_0",
         "--cache-type-v", "q4_0",
@@ -206,12 +191,11 @@ def ensure_llama_server(think: bool | None = None, model: dict | None = None) ->
         print("[!] llama.cpp 服务启动超时")
         sys.exit(1)
     print("[*] llama.cpp 服务已就绪")
-    # 记录上下文窗口与思考开关，供 opencode 配置自动同步（取自启动参数）
+    # 记录上下文窗口，供 opencode 配置自动同步（取自启动参数）
     try:
         model["context_window"] = int(args[args.index("-c") + 1])
     except (ValueError, IndexError):
         model["context_window"] = None
-    model["reasoning"] = bool(think)
     return model
 
 
@@ -298,7 +282,6 @@ def register_model(model: dict) -> None:
     llama["models"] = {}
     llama["models"][model_id] = {
         "name": model_id,
-        "reasoning": bool(model.get("reasoning")),
         "tool_call": True,
         "attachment": multimodal,
         "limit": {

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 from typing import Any
 
@@ -278,11 +279,17 @@ reason: 一句话说明为什么这样做
         self,
         prompt: str,
         image: bytes | None = None,
+        reasoning_effort: str = "low",
+        enable_thinking: bool = True,
+        preserve_thinking: bool = True,
     ) -> str:
         """发送对话，返回助手回复文本。
 
         prompt: 用户输入
         image: 可选位图 bytes；传入则走多模态视觉，为空则纯文本。
+        reasoning_effort: 推理深度，支持 xhigh / medium / low。
+        enable_thinking: 是否启用思考。
+        preserve_thinking: 是否在回复中保留思考内容。
         """
         # 构造 OpenAI 风格消息；有图时 content 为数组
         if image is not None:
@@ -301,6 +308,11 @@ reason: 一句话说明为什么这样做
         payload: dict[str, Any] = {
             "messages": [{"role": "user", "content": content}],
             "stream": True,
+            "reasoning_effort": reasoning_effort,
+            "chat_template_kwargs": {
+                "enable_thinking": enable_thinking,
+                "preserve_thinking": preserve_thinking,
+            },
         }
         url = f"{self.base_url}/v1/chat/completions"
         with requests.post(url, json=payload, timeout=self.timeout, stream=True) as resp:
@@ -348,3 +360,32 @@ reason: 一句话说明为什么这样做
             print()
         self.last_response = {"message": {"content": content_out, "thinking": thinking}}
         return content_out
+
+
+def main() -> None:
+    """测试入口。
+
+    自动读取 llm 目录下的图片（.png/.jpg/.jpeg/.webp/.bmp，若有）作为视觉输入，
+    否则回退为纯文本。
+    """
+    client = LlamaCppClient()
+
+    image: bytes | None = None
+    for name in os.listdir(os.path.dirname(__file__)):
+        if name.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+            with open(os.path.join(os.path.dirname(__file__), name), "rb") as f:
+                image = f.read()
+            print(f"使用图片: {name}")
+            break
+
+    if image is None:
+        print("未找到图片，使用纯文本模式。")
+
+    prompt = "你好" if image is None else "这里面的选项哪些是可选的？哪些是缺货的？通过字体颜色深浅判断"
+    reply = client.chat(prompt, image)
+    
+    
+
+
+if __name__ == "__main__":
+    main()
